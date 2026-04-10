@@ -1,12 +1,17 @@
 """
-Multiprocessing Queue Demo — With Output Queue + Reconstructor
---------------------------------------------------------------
-Pipeline:
-  - Multiple PDF producers put (pdf_id, page_num, total_pages, image_bytes) into input queue
-  - Worker processes (each with N threads) process pages → put results in output queue
-  - Reconstructor thread in main reads output queue → assembles results per PDF
-  - Once all pages of a PDF arrive → marked complete
-  - Timeout handling for incomplete PDFs
+PDF Folder Processor
+--------------------
+Watches an input folder for PDFs, processes each page through
+a multiprocessing worker pool (simulated ONNX), and saves
+results as JSON per PDF to an output folder.
+
+Folder structure:
+  ./input/   ← drop PDFs here
+  ./output/  ← JSON results appear here
+
+Usage:
+  python mp_queue_demo.py
+  Ctrl+C to stop
 """
 
 import multiprocessing
@@ -14,34 +19,46 @@ import threading
 import time
 import random
 import signal
-import numpy as np
+import json
+import os
+import tempfile
+import uuid
 from multiprocessing import Queue, Event
+from pathlib import Path
+
+import fitz  # PyMuPDF
+import numpy as np
 
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
-from rich.panel import Panel
 from rich.columns import Columns
 from rich import box
 
 # ── Config ───────────────────────────────────────────────────────────────────
-NUM_PROCESSES        = 2
-THREADS_PER_PROCESS  = 4
-QUEUE_MAXSIZE        = 16
-PRODUCER_INTERVAL    = 0.3   # seconds between pages
-PDF_TIMEOUT          = 30.0  # seconds before incomplete PDF is dropped
-NUM_PDFS             = 10     # how many PDFs to simulate
-PAGES_PER_PDF        = 40     # pages per PDF
+NUM_PROCESSES       = 2
+THREADS_PER_PROCESS = 4
+INPUT_QUEUE_SIZE    = 16
+OUTPUT_QUEUE_SIZE   = 16
+PDF_TIMEOUT         = 60.0   # seconds before incomplete PDF is dropped
+SCAN_INTERVAL       = 2.0    # how often to scan input folder for new PDFs
+DPI                 = 150    # page render resolution
+
+INPUT_DIR  = Path("./input")
+OUTPUT_DIR = Path("./output")
 
 console = Console()
 
 # ── Simulated ONNX inference ──────────────────────────────────────────────────
-def fake_onnx_run(image_bytes):
-    """Returns fake bboxes as numpy array — simulates PaddleOCR detection output."""
-    time.sleep(random.uniform(0.3, 0.8))
-    num_boxes = random.randint(3, 10)
-    bboxes = np.random.rand(num_boxes, 4).astype(np.float32)  # (N, 4) fake boxes
-    texts  = [f"text_{i}" for i in range(num_boxes)]
+def fake_onnx_run(numpy_image):
+    """
+    Replace this with real PaddleOCR ONNX session.run().
+    Returns fake bboxes and texts.
+    """
+    time.sleep(random.uniform(0.1, 0.4))
+    num_boxes = random.randint(2, 8)
+    bboxes = np.random.rand(num_boxes, 4).astype(np.float32)
+    texts  = [f"text_box_{i}" for i in range(num_boxes)]
     return bboxes, texts
 
 # ── Worker thread ─────────────────────────────────────────────────────────────
@@ -55,16 +72,30 @@ def worker_thread(input_queue, output_queue, shutdown_event, stats, worker_id, t
         except Exception:
             continue
 
-        pdf_id, page_num, total_pages, image_bytes = item
+        pdf_id, pdf_name, page_num, total_pages, tmp_path = item
+        stats[key] = {"status": "processing", "page": f"{pdf_name}:p{page_num}", "processed": stats[key]["processed"]}
 
-        stats[key] = {"status": "processing", "page": f"{pdf_id}:p{page_num}", "processed": stats[key]["processed"]}
+        try:
+            # load image into numpy then immediately delete temp file
+            import cv2
+            numpy_image = cv2.imread(tmp_path)
+            os.remove(tmp_path)  # file served its purpose
 
-        bboxes, texts = fake_onnx_run(image_bytes)
+            if numpy_image is None:
+                raise ValueError(f"cv2.imread failed for {tmp_path}")
 
-        # put result in output queue for reconstructor
-        output_queue.put((pdf_id, page_num, total_pages, bboxes, texts))
+            bboxes, texts = fake_onnx_run(numpy_image)
 
-        stats[key] = {"status": "idle", "page": f"{pdf_id}:p{page_num}", "processed": stats[key]["processed"] + 1}
+            # serialize bboxes as list for JSON compatibility
+            output_queue.put((pdf_id, pdf_name, page_num, total_pages, bboxes.tolist(), texts))
+
+        except Exception as e:
+            console.log(f"[red]Worker error on {pdf_name} page {page_num}: {e}[/red]")
+            # still need to clean up temp file if it exists
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        stats[key] = {"status": "idle", "page": f"{pdf_name}:p{page_num}", "processed": stats[key]["processed"] + 1}
 
     stats[key] = {"status": "stopped", "page": "-", "processed": stats[key]["processed"]}
 
@@ -73,7 +104,7 @@ def worker_process(input_queue, output_queue, shutdown_event, stats, worker_id):
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     # In real code: session = ort.InferenceSession("model.onnx")
-    stats[f"W{worker_id}-session"] = "loaded"
+    console.log(f"[cyan]Worker {worker_id} started (pid={os.getpid()})[/cyan]")
 
     threads = []
     for t_id in range(THREADS_PER_PROCESS):
@@ -91,115 +122,165 @@ def worker_process(input_queue, output_queue, shutdown_event, stats, worker_id):
 # ── Reconstructor thread ──────────────────────────────────────────────────────
 def reconstructor(output_queue, shutdown_event, stats):
     """
-    Runs in main process as a thread.
-    Reads results from output_queue → assembles per-PDF hashmap.
-    Marks PDF complete when all pages arrive.
-    Drops PDF if timeout exceeded.
+    Reads from output queue, assembles per-PDF results, saves JSON when complete.
+    hashmap[pdf_id] = {
+        "name":       original filename,
+        "total":      total pages,
+        "pages":      { page_num: { "bboxes": [...], "texts": [...] } },
+        "first_seen": timestamp
+    }
     """
-    # hashmap[pdf_id] = {
-    #   "total": int,
-    #   "pages": { page_num: (bboxes, texts) },
-    #   "first_seen": float  ← timestamp of first page arrival
-    # }
     hashmap = {}
     stats["reconstructor"] = {"completed": 0, "timeout": 0, "in_progress": 0}
 
     while not shutdown_event.is_set():
-        # ── step 1: drain output queue ──
+        # ── drain output queue ──
         try:
-            pdf_id, page_num, total_pages, bboxes, texts = output_queue.get(timeout=1)
+            pdf_id, pdf_name, page_num, total_pages, bboxes, texts = output_queue.get(timeout=1)
 
-            # ── step 2: initialize entry if first page of this PDF ──
             if pdf_id not in hashmap:
                 hashmap[pdf_id] = {
-                    "total": total_pages,
-                    "pages": {},
+                    "name":       pdf_name,
+                    "total":      total_pages,
+                    "pages":      {},
                     "first_seen": time.time()
                 }
 
-            # ── step 3: store page result ──
-            hashmap[pdf_id]["pages"][page_num] = (bboxes, texts)
+            hashmap[pdf_id]["pages"][page_num] = {
+                "bboxes": bboxes,
+                "texts":  texts
+            }
 
         except Exception:
-            pass  # output queue empty, fall through to timeout check
+            pass
 
-        # ── step 4: check completed PDFs ──
+        # ── check completed PDFs ──
         completed = []
         for pid, data in hashmap.items():
             if len(data["pages"]) == data["total"]:
-                # reconstruct in order
-                ordered = [data["pages"][i] for i in sorted(data["pages"].keys())]
-                console.log(f"[green]✓ PDF [bold]{pid}[/bold] complete — {len(ordered)} pages reconstructed[/green]")
+                # reconstruct in page order
+                ordered_pages = [
+                    {"page": i, **data["pages"][i]}
+                    for i in sorted(data["pages"].keys())
+                ]
+
+                result = {
+                    "pdf_id":     pid,
+                    "filename":   data["name"],
+                    "total_pages": data["total"],
+                    "pages":      ordered_pages
+                }
+
+                # save to output folder
+                out_path = OUTPUT_DIR / f"{data['name']}_{pid[:8]}.json"
+                with open(out_path, "w") as f:
+                    json.dump(result, f, indent=2)
+
+                console.log(f"[green]✓ {data['name']} complete → {out_path.name}[/green]")
                 completed.append(pid)
 
         for pid in completed:
             del hashmap[pid]
             s = stats["reconstructor"]
-            stats["reconstructor"] = {**s, "completed": s["completed"] + 1}
+            stats["reconstructor"] = {**s, "completed": s["completed"] + 1, "in_progress": len(hashmap) - 1}
 
-        # ── step 5: check timed out PDFs ──
+        # ── check timed out PDFs ──
         timed_out = []
         for pid, data in hashmap.items():
             if time.time() - data["first_seen"] > PDF_TIMEOUT:
-                got   = len(data["pages"])
-                total = data["total"]
-                console.log(f"[red]✗ PDF [bold]{pid}[/bold] timed out — got {got}/{total} pages[/red]")
+                got = len(data["pages"])
+                console.log(f"[red]✗ {data['name']} timed out — {got}/{data['total']} pages[/red]")
                 timed_out.append(pid)
 
         for pid in timed_out:
             del hashmap[pid]
             s = stats["reconstructor"]
-            stats["reconstructor"] = {**s, "timeout": s["timeout"] + 1}
+            stats["reconstructor"] = {**s, "timeout": s["timeout"] + 1, "in_progress": len(hashmap) - 1}
 
-        # update in_progress count
         s = stats["reconstructor"]
         stats["reconstructor"] = {**s, "in_progress": len(hashmap)}
 
-# ── Producer ──────────────────────────────────────────────────────────────────
+# ── Producer / folder watcher ─────────────────────────────────────────────────
 def producer(input_queue, shutdown_event, stats):
     """
-    Simulates multiple PDFs being submitted to the API.
-    Each PDF's pages are put into the input queue.
-    In real code: triggered per API request.
+    Scans INPUT_DIR every SCAN_INTERVAL seconds for new PDFs.
+    Converts each page to a temp image file and puts metadata in input queue.
+    Moves processed PDFs to input/processed/ to avoid re-processing.
     """
-    stats["producer"] = {"status": "running", "queued": 0}
+    processed_dir = INPUT_DIR / "processed"
+    processed_dir.mkdir(exist_ok=True)
+
+    stats["producer"] = {"status": "watching", "queued": 0, "pdfs_seen": 0}
     queued = 0
+    pdfs_seen = 0
 
-    for pdf_idx in range(NUM_PDFS):
-        if shutdown_event.is_set():
-            break
+    console.log(f"[cyan]Watching {INPUT_DIR} for PDFs...[/cyan]")
 
-        pdf_id      = f"pdf_{pdf_idx:03d}"
-        total_pages = PAGES_PER_PDF
+    while not shutdown_event.is_set():
+        pdf_files = list(INPUT_DIR.glob("*.pdf"))
 
-        # simulate pages arriving one by one (out of order is fine)
-        page_order = list(range(total_pages))
-        random.shuffle(page_order)  # shuffle to prove reconstructor handles out-of-order
-
-        for page_num in page_order:
+        for pdf_path in pdf_files:
             if shutdown_event.is_set():
                 break
 
-            fake_image_bytes = bytes(random.getrandbits(8) for _ in range(1024))
+            pdf_name = pdf_path.stem
+            pdf_id   = str(uuid.uuid4())
+            pdfs_seen += 1
+
+            console.log(f"[cyan]Found {pdf_path.name} → pdf_id={pdf_id[:8]}...[/cyan]")
 
             try:
-                input_queue.put((pdf_id, page_num, total_pages, fake_image_bytes), timeout=1)
-                queued += 1
-                stats["producer"] = {"status": "running", "queued": queued}
-            except Exception:
-                continue
+                doc         = fitz.open(str(pdf_path))
+                total_pages = len(doc)
 
-            time.sleep(PRODUCER_INTERVAL)
+                for page_num in range(total_pages):
+                    if shutdown_event.is_set():
+                        break
 
-    stats["producer"] = {"status": "done", "queued": queued}
+                    page = doc[page_num]
+                    mat  = fitz.Matrix(DPI / 72, DPI / 72)  # 72 is base DPI in fitz
+                    pix  = page.get_pixmap(matrix=mat)
+
+                    # write to named temp file — worker will delete after loading
+                    tmp = tempfile.NamedTemporaryFile(
+                        delete=False,
+                        suffix=".png",
+                        prefix=f"{pdf_id}_{page_num}_"
+                    )
+                    pix.save(tmp.name)
+                    tmp.close()
+
+                    input_queue.put(
+                        (pdf_id, pdf_name, page_num, total_pages, tmp.name),
+                        timeout=5
+                    )
+                    queued += 1
+                    stats["producer"] = {"status": "watching", "queued": queued, "pdfs_seen": pdfs_seen}
+
+                doc.close()
+
+                # move to processed/ so we don't re-process it
+                pdf_path.rename(processed_dir / pdf_path.name)
+                console.log(f"[dim]Moved {pdf_path.name} to processed/[/dim]")
+
+            except Exception as e:
+                console.log(f"[red]Failed to process {pdf_path.name}: {e}[/red]")
+
+        time.sleep(SCAN_INTERVAL)
+
+    stats["producer"] = {**stats["producer"], "status": "stopped"}
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 def build_dashboard(stats):
-    worker_table = Table(box=box.ROUNDED, title="[bold cyan]Workers[/bold cyan]",
-                         header_style="bold magenta", expand=True)
+    worker_table = Table(
+        box=box.ROUNDED,
+        title="[bold cyan]Workers[/bold cyan]",
+        header_style="bold magenta",
+        expand=True
+    )
     worker_table.add_column("Worker",    style="cyan", width=14)
     worker_table.add_column("Status",    width=16)
-    worker_table.add_column("Last Page", width=14)
+    worker_table.add_column("Last Page", width=20)
     worker_table.add_column("Done",      justify="right", width=6)
 
     for w_id in range(NUM_PROCESSES):
@@ -219,28 +300,35 @@ def build_dashboard(stats):
 
             worker_table.add_row(key, status_str, info["page"], str(info["processed"]))
 
-    # ── stats panel ──
-    producer_info = stats.get("producer", {"status": "starting", "queued": 0})
+    producer_info = stats.get("producer",      {"status": "starting", "queued": 0, "pdfs_seen": 0})
     recon_info    = stats.get("reconstructor", {"completed": 0, "timeout": 0, "in_progress": 0})
 
-    stats_table = Table(box=box.ROUNDED, title="[bold cyan]Pipeline Stats[/bold cyan]", expand=True)
+    stats_table = Table(
+        box=box.ROUNDED,
+        title="[bold cyan]Pipeline Stats[/bold cyan]",
+        expand=True
+    )
     stats_table.add_column("Metric", style="cyan")
     stats_table.add_column("Value",  justify="right")
 
-    p_status = {"running": "[green]running[/green]", "done": "[blue]done[/blue]"}.get(
-        producer_info["status"], "[yellow]starting[/yellow]"
-    )
-    stats_table.add_row("Producer",       p_status)
+    p_color  = "green" if producer_info["status"] == "watching" else "red"
+    stats_table.add_row("Producer",       f"[{p_color}]{producer_info['status']}[/{p_color}]")
+    stats_table.add_row("PDFs Seen",      str(producer_info["pdfs_seen"]))
     stats_table.add_row("Pages Queued",   str(producer_info["queued"]))
     stats_table.add_row("PDFs In Flight", str(recon_info["in_progress"]))
     stats_table.add_row("PDFs Complete",  f"[green]{recon_info['completed']}[/green]")
     stats_table.add_row("PDFs Timed Out", f"[red]{recon_info['timeout']}[/red]")
-    stats_table.add_row("Timeout (s)",    str(PDF_TIMEOUT))
+    stats_table.add_row("Input Folder",   str(INPUT_DIR))
+    stats_table.add_row("Output Folder",  str(OUTPUT_DIR))
 
     return Columns([worker_table, stats_table], expand=True)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    # ensure folders exist
+    INPUT_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
     shutdown_event = Event()
 
     def handle_sigint(sig, frame):
@@ -248,10 +336,10 @@ def main():
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    manager     = multiprocessing.Manager()
-    stats       = manager.dict()
-    input_queue  = Queue(maxsize=QUEUE_MAXSIZE)
-    output_queue = Queue(maxsize=QUEUE_MAXSIZE)
+    manager      = multiprocessing.Manager()
+    stats        = manager.dict()
+    input_queue  = Queue(maxsize=INPUT_QUEUE_SIZE)
+    output_queue = Queue(maxsize=OUTPUT_QUEUE_SIZE)
 
     # spawn worker processes
     processes = []

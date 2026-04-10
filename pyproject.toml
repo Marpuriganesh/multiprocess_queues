@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "fitz>=0.0.1.dev2",
     "numpy>=2.4.4",
+    "opencv-python>=4.13.0.92",
     "rich>=14.3.3",
 ]
